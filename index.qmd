@@ -1,0 +1,10 @@
+---
+title: "Avocado Forecasts"
+image: forecasts_comparisons.png
+about: 
+  template: solana
+  image-shape: rounded
+  image-width: 30em
+---
+
+This work presents the development of different forecasts for avocado sales volume in the United States to support operational decision making. This analysis aims to find the forecast that best suits each needs based on an evaluation of forecast accuracy in both their point effectiveness and confidence interval accuracy. Two versions of documents are presented, one in English and one in Spanish, which can be accessed from the navigation bar.

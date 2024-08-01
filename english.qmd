@@ -1,0 +1,1029 @@
+---
+title: "English Version"
+author: "Arturo Carrillo Villarreal"
+format: html
+toc: true
+toc-depth: 3
+editor: visual
+execute: 
+  echo: false
+---
+# U.S. Avocado Sales Volume Forecast
+The following document presents the development of different forecasts for avocado sales volume in the United States. The document is divided by sections related to the type of process or forecast.
+
+Models:
+
+1.  Exponential Smoothing
+
+2.  ARIMA
+
+3.  STL Decomposition
+
+4.  Prophet
+
+5.  Neural Network Auto-Regression
+
+## PACKAGES
+
+Packages loaded in the library required for this analysis.
+
+```{r}
+#| echo: true
+#| output: false
+#| warning: false
+# Packages
+packages = c('dplyr','ggplot2','tsibble','fable','feasts',
+             'gridExtra','tseries','fable.prophet','plotly')
+lapply(packages, library, character.only=TRUE)
+
+```
+
+```{r}
+#| echo: false
+#| output: false
+#| warning: false
+# Directory
+setwd("C:/Users/arturo.carrillo/Documents/Varios/Personal/Projects/GitHub/avocado_forecasts")
+
+# Importa data
+avocado_data = read.csv("avocado_data.csv")
+
+# Set the default language of date to english
+Sys.setlocale("LC_TIME", "English")
+```
+
+## DATA PREPARATION
+
+First, the loaded database is prepared in order to select only the data of the series of interest, group the information by months and convert the units of the sales volume in pounds to tons. We are interested in knowing the total US monthly volume of organic avocados.
+
+```{r}
+#| echo: true
+
+serie = avocado_data %>% 
+  select(Date, TotalVolume, type, region) %>% 
+  filter(type == "organic" & region == "TotalUS") %>%
+  mutate(Month = yearmonth(Date)) %>% 
+  group_by(Month) %>% summarise(Volume = sum(TotalVolume)) %>% 
+  filter(row_number() <= n()-1) %>% #Remove last row due to incomplete information
+  as_tsibble(index = Month)
+
+# Convert volume from pounds to tons
+serie$Volume = (serie$Volume * 0.453592)/1000
+```
+
+## ANALYZE ORIGINAL SERIES, SEASONALITY AND HETEROSCEDASTICITY.
+
+### Original series
+
+First, the original series is analyzed and the presence of seasonality is investigated.
+
+```{r}
+#| echo: true
+# Plot Original Series
+graf_san = serie %>% autoplot(Volume) + geom_point() + 
+  labs(y = "Thousands of tons", x = "",
+       title = "Avocado sales volume in the U.S., 2015-2023")
+ggplotly(graf_san)
+```
+
+It can be seen that the series has a positive trend, as well as the possible presence of heteroscedasticity and seasonality.
+
+### Seasonality
+
+The following seasonality plots with the `gg_season()` and `gg_subseries()` functions confirm the presence of seasonality.
+
+```{r}
+#| message: false
+# Seasonality Chart
+gg_season(serie, labels = "right") +
+  labs(title = "Seasonality chart: Line by year")
+
+# Sub-series plot
+gg_subseries(serie) +
+  labs(title = "Seasonality plot: Sub-series")
+```
+
+### Heterocedasticity
+
+When suspecting the presence of heteroscedasticity, a first difference is drawn to see how it behaves over time.
+
+```{r}
+#| echo: true
+# First Difference
+serie_dif = 
+  serie %>%
+  mutate(Difference = difference(Volume, order_by = Month)) %>%
+  select(-Volume) %>%
+  filter(row_number() > 1)
+
+# Graficar First Difference
+graf_serie_dif = serie_dif %>% autoplot(Difference) +
+  geom_hline(yintercept = mean(serie_dif$Difference),lty=2,col="red") +
+  geom_point() + 
+  labs(title = "First Difference", x="")
+
+ggplotly(graf_serie_dif)
+```
+
+Looking at the plot of the first difference confirms the presence of heteroscedasticity as the variance increases over time. Therefore, it will be necessary to perform some transformation.
+
+## SERIES TRANSFORMATION
+
+A Box-Cox transformation will be performed to deal with the heteroscedasticity of the series for which the Guerrero method will be used to obtain it.
+
+```{r}
+#| echo: true
+# Estimating Lambda
+lambda = 
+  serie %>%
+  features(Volume, features = guerrero) %>%
+  pull(lambda_guerrero)
+
+# Transformed Series
+graf_st = serie %>% 
+  autoplot(box_cox(Volume,lambda)) + 
+  geom_point() + 
+  labs(
+    title = "Box-Cox transformed series",
+    x ="", y= ""
+  )
+
+# Original and transformed series comparison graphs
+grid.arrange(graf_san,graf_st)
+```
+
+A comparison of the first difference of the original series and the transformed series is also used to show how heteroscedasticity is corrected by the transformation.
+
+```{r}
+# First difference of transformed series
+st_dif = 
+  serie %>%
+  mutate(Difference = difference(box_cox(Volume,lambda), order_by = Month)) %>%
+  select(-Volume) %>%
+  filter(row_number() > 1)
+
+# Plot First Difference
+graf_st_dif = st_dif %>% autoplot(Difference) +
+  geom_hline(yintercept = mean(st_dif$Difference),lty=2,col="red") +
+  geom_point() + 
+  labs(title = "First Difference of Transformed Series", x="")
+
+# Comparison graph of first difference of series and transformed series
+grid.arrange(graf_serie_dif,graf_st_dif)
+```
+
+## SERIES DECOMPOSITION
+
+The following is a decomposition of the series into its various components using the STL method, which stands for *Seasonal and Trend decomposition using Loess*.
+
+```{r}
+# Plot All components
+serie %>%
+  model(STL(box_cox(Volume,lambda))) %>%
+  components() %>%
+  autoplot()
+```
+
+To better identify trend changes in the trend-cycle indicator, a graph is made where it changes color according to its direction.
+
+```{r}
+#| echo: true
+# Trend-Cycle
+trend_cycle = 
+  serie %>%
+  model(STL(box_cox(Volume,lambda))) %>%
+  components() %>%
+  select(Month, trend) %>%
+  mutate(dif = difference(trend))
+
+# Shifting Color for Plotting
+ccpg = c()
+#Note: One period is lagged to coincide with the start of the changeover.
+for (i in 2:nrow(trend_cycle)){
+  if(trend_cycle$dif[i] >= 0){
+    ccpg = append(ccpg, 'black')
+  }else{
+    ccpg = append(ccpg, 'red')
+  }
+}
+#last color equal to the last color available
+ccpg = append(ccpg, ccpg[length(ccpg)])
+
+# Trend-Cycle Graph
+trend_cycle %>%
+  select(-dif) %>%
+  mutate(trend = inv_box_cox(trend,lambda)) %>%
+  ggplot(aes(x = Month, y = trend)) + 
+  geom_line(col=ccpg, lwd=1.5) +
+  labs(title = "Avocado Sales Volume Trend-Cycle",
+       subtitle = "United States, 2015 - 2023",
+       y = "Thousands of tons", x = "",
+       )
+```
+
+## TRAINING AND TEST DATA SETS
+
+To evaluate the accuracy of the forecasts, the series is separated into a training data set and a test data set. For this exercise we seek to forecast the following 10 periods (Months).
+
+```{r}
+#| echo: true
+# Steps to forecast
+pap = 10
+
+# Training Data
+train_ini = substr(as.character(as.Date(serie$Month[1])),1,7)
+train_end = substr(as.character(as.Date(serie$Month[nrow(serie)-pap])),1,7)
+train_data = serie %>%
+  filter_index(train_ini ~ train_end)
+
+# Test Data
+test_ini = substr(as.character(as.Date(serie$Month[nrow(serie) - pap + 1])),1,7)
+test_data = serie %>% filter_index(test_ini ~.)
+```
+
+## EXPONENTIAL SMOOTHING
+
+### Tentative Identification of the Model
+
+The first model to review is the Exponential Smoothing model for which we are going to use the characteristics of the behavior of the series previously identified to give us an idea of what would be the best model for the series we have.
+
+Identified characteristics:
+
+-   Trend
+
+-   Seasonality
+
+-   Heterocedasticity
+
+Since these characteristics are detected, the following models will be analyzed:
+
+-   ETS(M,A,M)
+
+-   ETS(M,Ad,M)
+
+In addition, it is reviewed whether the Automatic Model represents a good alternative.
+
+```{r}
+#| echo: true
+# Models to Review
+mod_se = train_data %>%
+  model(
+    Auto = ETS(Volume), # Automatic model <ETS(M,Ad,A)>
+    MAM = ETS(Volume ~ error("M") + trend("A") + season("M")),
+    MAdM = ETS(Volume ~ error("M") + trend("Ad") + season("M")),
+  )
+
+
+# Information Criteria (AICc)
+glance(mod_se) %>% arrange(AICc)
+```
+
+Although the *ETS(M,Ad,A)* automatic model seems to show a better information criterion of AICc, it uses an additive stationarity, which given the heteroscedasticity of the model is not recommended, so we will select the *ETS(M,Ad,M)* model, which makes more sense given the behavior of the series.
+
+When evaluating the accuracy of the models, it is observed that the *ETS(M,Ad,M)* model has a better performance than the *ETS(M,A,M)* model, so we will use the latter, which is an Exponential Smoothing with Damped Trend, Multiplicative Stationarity and Multiplicative Errors.
+
+```{r}
+# Forecast Accuracy
+mod_se %>% forecast(h = pap) %>% accuracy(test_data) %>% 
+  select(.model,RMSE,MAE,MAPE) %>% arrange(MAPE)
+```
+
+### Model Validation
+
+Once the model to be used has been identified, it must be validated by analyzing its residuals. First we will review the assumptions of $E[mu]=0$ and homoscedasticity.
+
+```{r}
+## Model Residuals Analysis ##
+# Model to Review
+mar = "MAdM"
+residuals = augment(mod_se) %>% filter(.model == mar) # residuals of the Model to Review
+
+# Residuals chart
+residuals %>% ggplot(aes(x = Month, y = .innov)) + geom_line() + geom_point() +
+  geom_hline(yintercept = 0, lty=2, col="red") +
+  labs(y = "", x = "", title = "Residuals review: E[m] = 0 and Homoscedasticity")
+```
+
+It can be seen that these assumptions are fulfilled, now it remains to see the assumption of normality.
+
+### Residuals normality check
+
+We seek to analyze by means of histogram, quantile-quantile plots and the Jarque-Bera test the assumption of normality of the residuals of the model.
+
+```{r}
+#| echo: true
+# Residuals histogram
+hist_plot = residuals %>% ggplot(aes(x = .innov)) +
+  geom_histogram(bins = 20, lwd = 1.5,col = 'white', fill = 'slategrey') +
+  labs(title = "Residuals Normality Check: Histogram and Quantile-Quantile", 
+       x = "Residuals", y ="Frequency")
+# Q-Q Plot
+qq_plot = residuals %>% ggplot(aes(sample = .innov)) + 
+  stat_qq(col = 'slateblue') + stat_qq_line() +
+  labs(x = "Theoretical Quantiles", y ="Sample Quantiles")
+grid.arrange(hist_plot,qq_plot)
+
+# Jarque-Bera Test
+# p-value > 0.05 indicates that it cannot be rejected as normally distributed.
+jarque.bera.test(residuals$.innov)
+```
+
+It may be debatable whether the assumption of normality can be considered valid given the plots and the test that indicates that it cannot be rejected that the residuals are normally distributed.
+
+In this situation, two alternatives are offered for the generation of confidence intervals. They can be performed assuming normal distribution, or also by means of a *Bootstrap* simulation.
+
+### Forecast Charts
+
+```{r}
+#| echo: true
+# Plot Forecast vs. Actual Values (Normal Distribution Assumption)
+graf_se_dn = mod_se %>% select(MAdM) %>% forecast(h = pap) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2019-01-01")),
+    lwd = 1.5,
+    level = 80
+  ) +
+  labs(title = "Exponential Smoothing Forecast ETS(M,Ad,M)",
+       subtitle = "ETS(M,Ad,M) Model with Normally Distributed Intervals",
+       x = "")
+
+# Plot Forecast vs. Actual Values (Bootstrap)
+graf_se_boot = mod_se %>% select(MAdM) %>% forecast(h = pap, bootstrap = TRUE) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2019-01-01")),
+      lwd = 1.5,
+    level = 80
+  ) +
+  labs(subtitle = "ETS(M,Ad,M) Model with Bootstrap Intervals",
+       x = "")
+grid.arrange(graf_se_dn,graf_se_boot)
+```
+
+Note that no major differences are observed between the two types of intervals.
+
+## ARIMA
+
+The second model to review is the Seasonal ARIMA or SARIMA for which we will also take advantage of the previously identified characteristics of the behavior of the series to give us an idea of which would be the best models. As the series has trend and seasonality, one or more differences may need to be drawn. On the other hand, the Box-Cox transformation can be used to correct for heteroscedasticity.
+
+### Tentative Model Identification
+
+First we need the series to be stationary, for which we calculated seasonal differences and first difference to identify if it is convenient to estimate more than one difference and if the first difference or the seasonal difference is preferred. When applying seasonal difference, it was not enough and another difference had to be computed On the other hand, by estimating only the first difference, it seems to be enough to make the series stationary.
+
+```{r}
+#| echo: true
+#| warning: false
+# diff(box_cox(Volume,lambda)) Mean for stationarity graph
+m_dif= train_data %>% 
+  mutate(dif_vol = difference(box_cox(Volume,lambda))) %>%
+  pull(dif_vol) %>% mean(na.rm = TRUE)
+
+# Plot of Differences Required for Stationarity
+train_data %>% autoplot(
+  box_cox(Volume,lambda) %>%
+    difference(1)
+)  + geom_point() +
+  labs(
+  title = "Stationarity Graph",
+  x = "", y = ""
+) +
+  geom_hline(yintercept = m_dif, lty=2, col="red")
+```
+
+The Unit Root and Seasonal Strength tests can also be used to detect which differences would be more convenient to calculate.
+
+```{r}
+#| echo: true
+#| warning: false
+#| message: false
+# Seasonal Difference Test
+# seasonal_strength_year >= 0.64 indicates to calculate seasonal difference
+train_data %>% features(box_cox(Volume,lambda), feat_stl)
+
+# Number of Seasonal Differences Required
+train_data %>% features(box_cox(Volume,lambda), unitroot_nsdiffs)
+
+
+# Unit Root Test
+# kpss_pvalue < 0.05 indicates calculate difference
+train_data %>% features(box_cox(Volume,lambda), unitroot_kpss)
+
+# Number of Differences Required
+train_data %>% features(box_cox(Volume,lambda), unitroot_ndiffs)
+```
+
+The various tests indicate that the recommended approach would be not to calculate seasonal difference and to calculate first difference.
+
+### ACF & PACF
+
+The next step would be to review the Sample and Partial Autocorrelation plots to identify tentative models.
+
+```{r}
+#| echo: true
+# Sample and Partial Autocorrelation Function Plots: ACF y PACF
+acf_plot = autoplot(ACF(train_data, difference(box_cox(Volume,lambda)), lag_max = 36)) +
+  labs(y = "ACF", x="", title = "Sample and Partial Autocorrelation Functions: ACF and PACF")
+pacf_plot = autoplot(PACF(train_data, difference(box_cox(Volume,lambda)), lag_max = 36)) +
+  labs(y = "PACF", x= "Lags")
+grid.arrange(acf_plot,pacf_plot)
+```
+
+### Model Estimation
+
+Different models were estimated based on the lags shown in the ACF and PACF and the analysis of residuals.
+
+```{r}
+#| echo: true
+# Estimate Model (d=1,D=0)
+mod_arima = train_data %>% 
+  model(
+    m210_002 = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(2,1,0) + PDQ(0,0,2)),
+    m011_002 = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(0,1,1) + PDQ(0,0,2)),
+    m810_002_c = ARIMA(box_cox(Volume,lambda) ~ 1 + pdq(8,1,0) + PDQ(0,0,2)),
+    m217_002_c = ARIMA(box_cox(Volume,lambda) ~ 1 + pdq(2,1,7) + PDQ(0,0,2)),
+    m312_002 = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(3,1,2) + PDQ(0,0,2)),
+    m119_002 = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(1,1,9) + PDQ(0,0,2))
+  )
+# Models sorted by AICc
+glance(mod_arima) %>% arrange(AICc)
+
+# Forecast Accuracy
+mod_arima %>% forecast(h = pap) %>% accuracy(test_data) %>% 
+  select(.model,RMSE,MAE,MAPE) %>% arrange(MAPE)
+```
+
+Their analysis was separated by differentiation for comparability.
+
+```{r}
+#| echo: true
+# Estimate Model (d=1,D=1)
+mod_arima = train_data %>% 
+  model(
+    m119_110 = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(1,1,9) + PDQ(1,1,0)),
+    m119_011 = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(1,1,9) + PDQ(0,1,1))
+  )
+# Models sorted by AICc
+glance(mod_arima) %>% arrange(AICc)
+
+# Forecast Accuracy
+mod_arima %>% forecast(h = pap) %>% accuracy(test_data) %>% 
+  select(.model,RMSE,MAE,MAPE) %>% arrange(MAPE)
+```
+
+Y después se eligieron los mejores modelos.
+
+```{r}
+# Estimate Model (seleccionados)
+mod_arima = train_data %>% 
+  model(
+    m810_002_c = ARIMA(box_cox(Volume,lambda) ~ 1 + pdq(8,1,0) + PDQ(0,0,2)),
+    m119_002 = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(1,1,9) + PDQ(0,0,2)),
+    m312_002 = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(3,1,2) + PDQ(0,0,2)),
+    m119_110 = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(1,1,9) + PDQ(1,1,0))
+  )
+
+# Models sorted by AICc
+glance(mod_arima) %>% arrange(AICc)
+
+# Forecast Accuracy
+mod_arima %>% forecast(h = pap) %>% accuracy(test_data) %>% 
+  select(.model,RMSE,MAE,MAPE) %>% arrange(MAPE)
+```
+
+The same process was followed for the validation of each model.
+
+### Model Validation
+
+The statistical significance of its components was reviewed and their residuals were extracted to analyze whether the assumptions were met.
+
+```{r}
+#| echo: true
+#| warning: false
+#| message: false
+# Model to Review
+mar = "m312_002"
+residuals = augment(mod_arima) %>% filter(.model == mar) # Residuals of the Model to Review
+
+# Review significance of values
+#tidy(mod_arima)
+mod_arima %>% select(mar) %>% tidy() %>% print(n=20)
+```
+
+The residuals were plotted so that the assumptions of $E[mu]=0$ and homoscedasticity were met.
+
+```{r}
+# Residuals chart
+residuals %>% ggplot(aes(x = Month, y = .innov)) + geom_line() + geom_point() +
+  geom_hline(yintercept = 0, lty=2, col="red") +
+  labs(y = "", x = "", title = "Residuals review: E[m] = 0 and Homoscedasticity")
+```
+
+ACF and PACF plots of the residuals were plotted to check for remaining autocorrelation in the model.
+
+```{r}
+# ACF and PACF of residuals
+acf_plot = autoplot(ACF(residuals, .innov, lag_max = 36)) +
+  labs(y = "ACF", x="", title = "Autocorrelation Functions of Residuals: ACF and PACF")
+pacf_plot = autoplot(PACF(residuals, .innov, lag_max = 36)) +
+  labs(y = "PACF", x= "Lags")
+grid.arrange(acf_plot,pacf_plot)
+```
+
+As well as the Ljung-Box test.
+
+```{r}
+# Ljung-Box test
+# p-value < 0.05 it is rejected that the values are independent (there is auto-correlation).
+# Number of Model parameters (p + q + P + Q)
+mod_arima %>% select(mar) # (3 + 2 + 0 + 2 = 7)
+
+augment(mod_arima) %>%
+  filter(.model == mar) %>%
+  features(.innov, ljung_box, lag = 24, dof = 7)
+
+```
+
+### Residuals normality check
+
+We seek to analyze by means of histogram, Q-Q plots and the Jarque-Bera test the assumption of normality of the residuals of the model.
+
+```{r}
+# Residuals normality check
+# Residuals histogram
+hist_plot = residuals %>% ggplot(aes(x = .innov)) +
+  geom_histogram(bins = 10, lwd = 1.5,col = 'white', fill = 'slategrey') +
+  labs(title = "Residuals Normality Check: Histogram and Quantile-Quantile", 
+       x = "Residuals", y ="Frequency")
+# Q-Q Plot
+qq_plot = residuals %>% ggplot(aes(sample = .innov)) + 
+  stat_qq(col = 'slateblue') + stat_qq_line() +
+  labs(x = "Theoretical Quantiles", y ="Sample Quantiles")
+grid.arrange(hist_plot,qq_plot)
+
+# Jarque-Bera Test
+# p-value > 0.05 indicates that it cannot be rejected as normally distributed.
+jarque.bera.test(residuals$.innov)
+```
+
+### Forecast Charts
+
+The forecasts of the main models were plotted for comparison.
+
+```{r}
+#| echo: true
+# Forecasting the Top 4 ARIMA Models
+# ARIMA Models for Plotting
+mod_arima_pg = mod_arima %>% 
+  select(
+    `ARIMA(1,1,9)(0,0,2)[12]` = m119_002,
+    `ARIMA(3,1,2)(0,0,2)[12]` = m312_002,
+    `ARIMA(8,1,0)(0,0,2)[12] c/ tendencia` = m810_002_c,
+    `ARIMA(1,1,9)(1,1,0)[12]` = m119_110
+  )
+
+# Plot Forecast vs. Actual values
+graf_arima_4m = mod_arima_pg %>% 
+  forecast(h = pap) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2021-01-01")),
+    level = NULL
+  ) +
+  labs(title = "Forecasting with ARIMA Models",x = "") +
+  theme(legend.position='none')  +
+  facet_wrap(vars(.model), ncol = 2)
+
+ggplotly(graf_arima_4m)
+
+```
+
+^Note: You can hover the cursor over the graph to see the values of each point.^
+
+Their confidence intervals were also plotted.
+
+```{r}
+#| echo: true
+# Plotting individual models with confidence intervals
+mod_arima_pg %>% forecast(h = pap) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2019-01-01")),
+    lwd = 1.5,
+  ) +
+  labs(title = "Forecasting with ARIMA Models", x = "",
+       subtitle = "80% and 95% confidence intervals") +
+  theme(legend.position='none')  +
+  facet_wrap(vars(.model), scales = "free", ncol = 2)
+```
+
+## FORECASTING WITH STL DECOMPOSITION
+
+Afterwards, the STL Decomposition model was reviewed, which uses the previously used method to decompose the series, to subsequently deseasonalize the series and apply a seasonal component by means of some other method, such as exponential smoothing (ETS). Since only one method is used, in this case we go directly to the residual analysis.
+
+```{r}
+#| echo: true
+# Estimate Model (ETS)
+mod_stl = train_data %>% 
+  model(
+    dstl = decomposition_model(
+      STL(box_cox(Volume,lambda)), #Decomposition method
+      ETS(season_adjust), #Seasonally adjusted series
+      ETS(season_year) #Seasonal component
+      )
+    )
+```
+
+### Model Validation
+
+```{r}
+## Model residuals analysis ##
+residuals = augment(mod_stl) # Residuals of the Model to Review
+
+# Residuals chart
+residuals %>% ggplot(aes(x = Month, y = .innov)) + geom_line() + geom_point() +
+  geom_hline(yintercept = 0, lty=2, col="red") +
+  labs(y = "", x = "", title = "Residuals review: E[m] = 0 and Homoscedasticity")
+
+# Residuals normality check
+# Residuals histogram
+hist_plot = residuals %>% ggplot(aes(x = .innov)) +
+  geom_histogram(bins = 10, lwd = 1.5,col = 'white', fill = 'slategrey') +
+  labs(title = "Residuals Normality Check: Histogram and Quantile-Quantile", 
+       x = "Residuals", y ="Frequency")
+# Q-Q Plot
+qq_plot = residuals %>% ggplot(aes(sample = .innov)) + 
+  stat_qq(col = 'slateblue') + stat_qq_line() +
+  labs(x = "Theoretical Quantiles", y ="Sample Quantiles")
+grid.arrange(hist_plot,qq_plot)
+
+# Jarque-Bera Test
+# p-value > 0.05 indicates that it cannot be rejected as normally distributed.
+jarque.bera.test(residuals$.innov)
+```
+
+### Forecast Charts
+
+Forecasts are made with confidence intervals with the assumption of normality and Bootstrap.
+
+```{r}
+# Plot Forecast vs. Actual Values (Normal Distribution Assumption)
+graf_stl_dn = mod_stl %>% forecast(h = pap) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2019-01-01")),
+    lwd = 1.5,
+    level = 80
+  ) +
+  labs(title = "Forecasting with STL Decomposition",
+       subtitle = "Model with Intervals with Normal Distribution",
+       x = "")
+
+# Plot Forecast vs. Actual Values (Bootstrap)
+graf_stl_boot = mod_stl %>% forecast(h = pap, bootstrap = TRUE) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2019-01-01")),
+    lwd = 1.5,
+    level = 80
+  ) +
+  labs(subtitle = "Bootstrap Interval Model",
+       x = "")
+
+grid.arrange(graf_stl_dn,graf_stl_boot)
+```
+
+## FORECASTING WITH PROPHET
+
+Forecasts were also made with the Facebook Prophet model using different orders and looking at their accuracy to choose the best model.
+
+```{r}
+#| echo: true
+# Estimating Models
+set.seed(10)
+mod_prophet = train_data %>% 
+  model(
+    `Order = 10` = prophet(Volume ~ season(
+      period="year", order = 10, type = "multiplicative")),
+    `Order = 5` = prophet(Volume ~ season(
+      period="year", order = 5, type = "multiplicative")),
+    `Order = 3` = prophet(Volume ~ season(
+      period="year", order = 3, type = "multiplicative")),
+    `Order = 2` = prophet(Volume ~ season(
+      period="year", order = 2, type = "multiplicative"))
+    )
+
+# Forecast Accuracy
+mod_prophet %>% forecast(h = pap) %>% accuracy(test_data) %>% 
+  select(.model,RMSE,MAE,MAPE) %>% arrange(MAPE)
+```
+
+Once the best model has been identified, it is validated.
+
+### Model Validation
+
+```{r}
+## Model residuals analysis ##
+# Model to Review
+mar = "Order = 10"
+residuals = augment(mod_prophet) %>% filter(.model == mar) # Residuals of the Model to Review
+
+# Residuals chart
+residuals %>% ggplot(aes(x = Month, y = .innov)) + geom_line() + geom_point() +
+  geom_hline(yintercept = 0, lty=2, col="red") +
+  labs(y = "", x = "", title = "Residuals review: E[m] = 0 and Homoscedasticity")
+
+# Residuals normality check
+# Residuals histogram
+hist_plot = residuals %>% ggplot(aes(x = .innov)) +
+  geom_histogram(bins = 10, lwd = 1.5,col = 'white', fill = 'slategrey') +
+  labs(title = "Residuals Normality Check: Histogram and Quantile-Quantile", 
+       x = "Residuals", y ="Frequency")
+# Q-Q Plot
+qq_plot = residuals %>% ggplot(aes(sample = .innov)) + 
+  stat_qq(col = 'slateblue') + stat_qq_line() +
+  labs(x = "Theoretical Quantiles", y ="Sample Quantiles")
+grid.arrange(hist_plot,qq_plot)
+
+# Jarque-Bera Test
+# p-value > 0.05 indicates that it cannot be rejected as normally distributed.
+jarque.bera.test(residuals$.innov)
+
+```
+
+### Forecast Charts
+
+The forecasts of the main models were plotted for comparison.
+
+```{r}
+# Plot Forecast vs. Actual values
+set.seed(10)
+graf_prophet = mod_prophet %>% 
+  forecast(h = pap) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2021-01-01")),
+    level = NULL
+  ) +
+  labs(title = "Forecasting with Prophet",x = "") +
+  theme(legend.position='none')  +
+  facet_wrap(vars(.model), ncol = 2)
+
+ggplotly(graf_prophet)
+```
+
+^Note: You can hover the cursor over the graph to see the values of each point.^
+
+Forecasts are also performed to check the confidence intervals of each model.
+
+```{r}
+# Plotting individual models with confidence intervals
+set.seed(10)
+mod_prophet %>% forecast(h = pap) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2019-01-01")),
+    lwd = 1.5,
+  ) +
+  labs(title = "Forecasting with Prophet", x = "",
+       subtitle = "80% and 95% confidence intervals") +
+  theme(legend.position='none')  +
+  facet_wrap(vars(.model), scales = "free", ncol = 2)
+```
+
+## FORECASTING WITH NEURAL NETWORK AUTOREGRESSION (NNAR)
+
+The Neural Network AutoRegressive Regression (NNAR) model is also reviewed to expand the options offered. For this model, different numbers of nodes are reviewed and their accuracy is reviewed to choose the best model.
+
+```{r}
+#| echo: true
+#| warning: false
+# Estimating Models NNAR
+set.seed(10) # set random numbers
+mod_rn = train_data %>% 
+  model(
+    `NNAR(10,1,2)` = NNETAR(box_cox(Volume,lambda),n_nodes=2),
+    `NNAR(10,1,3)` = NNETAR(box_cox(Volume,lambda),n_nodes=3),
+    `NNAR(10,1,4)` = NNETAR(box_cox(Volume,lambda),n_nodes=4),
+    `NNAR(10,1,6)` = NNETAR(box_cox(Volume,lambda),n_nodes=6)
+  )
+
+# Forecast Accuracy
+mod_rn %>% forecast(h = pap) %>% accuracy(test_data) %>% 
+  select(.model,RMSE,MAE,MAPE) %>% arrange(MAPE)
+```
+
+Once the best model has been identified, it is validated.
+
+### Model Validation
+
+```{r}
+#| message: false
+#| warning: false
+## Model residuals analysis ##
+# Model to Review
+mar = "NNAR(10,1,3)"
+residuals = augment(mod_rn) %>% filter(.model == mar) # Residuals of the Model to Review
+
+# Residuals chart
+residuals %>% ggplot(aes(x = Month, y = .innov)) + geom_line() + geom_point() +
+  geom_hline(yintercept = 0, lty=2, col="red") +
+  labs(y = "", x = "", title = "Residuals review: E[m] = 0 and Homoscedasticity")
+
+
+# Residuals normality check
+# Residuals histogram
+hist_plot = residuals %>% ggplot(aes(x = .innov)) +
+  geom_histogram(bins = 10, lwd = 1.5,col = 'white', fill = 'slategrey') +
+  labs(title = "Residuals Normality Check: Histogram and Quantile-Quantile", 
+       x = "Residuals", y ="Frequency")
+# Q-Q Plot
+qq_plot = residuals %>% ggplot(aes(sample = .innov)) + 
+  stat_qq(col = 'slateblue') + stat_qq_line() +
+  labs(x = "Theoretical Quantiles", y ="Sample Quantiles")
+grid.arrange(hist_plot,qq_plot)
+
+# Jarque-Bera Test
+# p-value > 0.05 indicates that it cannot be rejected as normally distributed.
+jarque.bera.test(na.omit(residuals$.innov))
+```
+
+### Forecast Charts
+
+Forecasts are made with confidence intervals with the assumption of normality and Bootstrap.
+
+```{r}
+# Plot Forecast vs. Actual Values (Normal Distribution Assumption)
+graf_rn_dn = mod_rn %>% select(mar) %>% forecast(h = pap) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2019-01-01")),
+    lwd = 1.5,
+    level = 80
+  ) +
+  labs(title = "Forecasting with Autoregression Neural Network Autoregression",
+       subtitle = "NNAR(10,1,3) Model with Normally Distributed Intervals",
+       x = "")
+
+# Plot Forecast vs. Actual Values (Bootstrap)
+set.seed(10)
+graf_rn_boot = mod_rn %>% select(mar) %>% forecast(h = pap, bootstrap = TRUE) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2019-01-01")),
+    lwd = 1.5,
+    level = 80
+  ) +
+  labs(subtitle = "NNAR(10,1,3) Model with Bootstrap Intervals",
+       x = "")
+
+grid.arrange(graf_rn_dn,graf_rn_boot)
+```
+
+The forecasts of the main models were plotted for comparison.
+
+```{r}
+# Plot Forecasts against Actual Values
+set.seed(10)
+graf_nnar = mod_rn %>% 
+  forecast(h = pap) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2021-01-01")),
+    level = NULL
+  ) +
+  labs(title = "Forecasting with Autoregression Neural Network Autoregression",x = "") +
+  theme(legend.position='none')  +
+  facet_wrap(vars(.model), ncol = 2)
+
+ggplotly(graf_nnar)
+```
+
+^Note: You can hover the cursor over the graph to see the values of each point.^
+
+Forecasts are also performed to check the confidence intervals of each model.
+
+```{r}
+# Plotting models with confidence intervals
+set.seed(10)
+mod_rn %>% forecast(h = pap) %>%
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2019-01-01")),
+    lwd = 1.5,
+  ) +
+  labs(title = "Forecasting with Autoregression Neural Network Autoregression", x = "",
+       subtitle = "80% and 95% confidence intervals") +
+  theme(legend.position='none')  +
+  facet_wrap(vars(.model), scales = "free", ncol = 2)
+```
+
+## CROSS-VALIDATION
+
+In order to perform a more complete evaluation of the point accuracy of the best models so far analyzed, a cross-validation is performed, which is a more sophisticated version of the training and test sets.
+
+For this procedure it is necessary to first make an extended series to go through a window where the size of the training set will be increased to see the accuracy in different scenarios and obtain an average error of these to evaluate the accuracy of each model.
+
+```{r}
+#| echo: true
+#| warning: false
+# Create extended series with index for Cross-Validation
+serie_alargada = serie %>% 
+  stretch_tsibble(.init = 80, .step = 10) %>%
+  filter(.id != max(.id))
+
+# Models for cross-validation
+set.seed(10)
+mod_vc = serie_alargada %>%
+  model(
+    `Exp. Smo. ETS(M,Ad,M)` = ETS(Volume ~ error("M") + trend("Ad") + season("M")),
+    `ARIMA(1,1,9)(1,1,0)` = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(1,1,9) + PDQ(1,1,0)),
+    `ARIMA(3,1,2)(0,0,2)` = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(3,1,2) + PDQ(0,0,2)),
+    `STL decomposition` = decomposition_model(STL(box_cox(Volume,lambda)),
+                                              ETS(season_adjust), ETS(season_year)),
+    `Prophet` = prophet(Volume ~ season(
+      period="year", order = 10, type = "multiplicative")),
+    `Neu. Net AR (10,1,3)` = NNETAR(box_cox(Volume,lambda),n_nodes=3)
+  )
+
+mod_vc %>% forecast(h = 10) %>% accuracy(serie) %>% 
+  select(.model,RMSE,MAE,MAPE) %>% arrange(MAPE)
+```
+
+## DISTRIBUTION ACCURACY
+
+It is also important to analyze the accuracy of the confidence intervals of the implemented models, for which different ways of evaluating the models are shown. These models will be evaluated for 10-period forecasts.
+
+We start with the *Skill Score*, which helps to rank the overall accuracy of the confidence intervals from best to worst, where the higher this score is, the more accurate the possible confidence intervals returned by the model will be.
+
+```{r}
+# Interval Accuracy with Skill Score
+# The higher the better
+set.seed(10)
+mod_vc %>% forecast(h = 10) %>% 
+  accuracy(serie, list(skill = skill_score(CRPS))) %>% arrange(desc(skill))
+```
+
+The above table shows that the Exponential Smoothing model ETS(M,Ad,M) has the best overall accuracy, regardless of the confidence level. However, the evaluation can be customized according to different needs, such as specific confidence intervals, or prioritizing the lower or upper part of the interval.
+
+On the other hand, the *Winkler Score* measures the accuracy for a given confidence level. The narrower the interval, the lower the Score. The more it misses the interval, the more it is penalized and the score increases. Therefore, the lower the Score the better. For example, for forecasts with a confidence level of 95%, the model that would show a better score would be the STL Decomposition Model, being the one that has the best balance between having a narrower range and not falling outside the range.
+
+```{r}
+# 95% Confidence Interval Accuracy
+# The narrower the interval, the lower the Score.
+# The more it falls outside the range, the more it is penalized and the score increases.
+# The lower the score the better
+set.seed(10)
+mod_vc %>% forecast(h = 10) %>% 
+  accuracy(serie, list(winkler = winkler_score), level = 95) %>% arrange(winkler)
+```
+
+Similarly, the *Quantile Score* may be useful if someone is more interested in not exceeding the lower or upper limit of the inteval. A specific score can be used for a given quantile. For instance, if someone's priority is to satisfy a demand and not producing less than can be sold, a quantile of 1% can be used:
+
+```{r}
+# Interval Accuracy with a Quantile Score Lower than 1%
+# The higher the better
+set.seed(10)
+mod_vc %>% forecast(h = 10) %>% 
+  accuracy(serie, list(qs = quantile_score), probs = 0.01) %>% arrange(qs)
+```
+
+On the other hand, if someone's priority was not to waste product and not to produce more than could be sold in order to avoid shrinkage, a 90% quantile can be used:
+
+```{r}
+# Interval Accuracy with a Quantile Score Higher than 90%
+# The higher the better
+set.seed(10)
+mod_vc %>% forecast(h = 10) %>% 
+  accuracy(serie, list(qs = quantile_score), probs = 0.9) %>% arrange(qs)
+```
+
+### Forecast Interval Graphs
+
+Finally, a comparison of the different forecasts for the next 10 periods is presented, showing their confidence intervals.
+
+```{r}
+# Selected Models with Trained Data (For Plotting)
+set.seed(10)
+mod_sel = train_data %>% 
+  model(
+    `Exp. Smo. ETS(M,Ad,M)` = ETS(Volume ~ error("M") + trend("Ad") + season("M")),
+    `ARIMA(1,1,9)(0,0,2)` = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(1,1,9) + PDQ(0,0,2)),
+    `ARIMA(3,1,2)(0,0,2)` = ARIMA(box_cox(Volume,lambda) ~ 0 + pdq(3,1,2) + PDQ(0,0,2)),
+    `STL decomposition` = decomposition_model(STL(box_cox(Volume,lambda)),
+                                 ETS(season_adjust), ETS(season_year)),
+    `Prophet` = prophet(Volume ~ season(
+      period="year", order = 10, type = "multiplicative")),
+    `Neu. Net AR (10,1,3)` = NNETAR(box_cox(Volume,lambda),n_nodes=3)
+  )
+
+# Comparative graph of forecasts
+set.seed(10)
+mod_sel %>%  forecast(h = pap) %>% 
+  autoplot(
+    serie %>% filter(Month >= yearmonth("2019-01-01")),
+    lwd = 1.5,
+  ) +
+  labs(title = "Forecasts Comparison", x = "",
+       subtitle = "80% and 95% confidence intervals") +
+  theme(legend.position='none')  +
+  facet_wrap(vars(.model), scales = "free", ncol = 2)
+```
+
+## CONCLUSIONS
+
+According to the particular needs different Models can be recommended. In general terms the **Exponential Smoothing Model ETS(M,Ad,M)** is the one that shows both a better point accuracy and a better confidence interval as measured by the *Skill Score*.
+
+However, if a confidence level has been determined beforehand, for example 95%, the model with the best confidence interval would be the **STL Decomposition Model** measured by the *Winkler Score*.
+
+Likewise, if what matters most is to satisfy a demand and not generate less than what might be needed, for example for a 99% confidence, the **STL Decomposition Model** would also be the best according to the *Quantile Score* for a 1% quantile.
+
+On the other hand, if the main concern is not to generate more than what might be needed (as to avoid shrinkage), for example, for a 90% confidence level, the indicated model would be the **ARIMA(3,1,2)(0,0,2)** model according to the *Quantile Score* for a 90% quantile.

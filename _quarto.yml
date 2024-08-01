@@ -1,0 +1,23 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "Avocado Forecasts"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - english.qmd
+      - spanish.qmd
+    background: primary
+
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    toc: true
+    toc-depth: 3
+
+
+
